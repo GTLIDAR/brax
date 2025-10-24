@@ -170,7 +170,7 @@ def _random_translate_pixels(
 
 
 def _remove_pixels(
-    obs: Union[jnp.ndarray, Mapping[str, jax.Array]]
+    obs: Union[jnp.ndarray, Mapping[str, jax.Array]],
 ) -> Union[jnp.ndarray, Mapping[str, jax.Array]]:
   if not isinstance(obs, Mapping):
     return obs
@@ -190,7 +190,9 @@ def _make_student_inference_fn(
     def policy(
         observations: types.Observation, key_sample: PRNGKey
     ) -> Tuple[types.Action, types.Extra]:
-      logits = student_network.apply(normalizer_params, policy_params, observations)
+      logits = student_network.apply(
+          normalizer_params, policy_params, observations
+      )
       if deterministic:
         actions = student_distribution.mode(logits)
         return actions, {'distribution_params': logits}
@@ -380,7 +382,9 @@ def train(
   student_make_policy = _make_student_inference_fn(
       l2t_net.student_policy, l2t_net.student_distribution
   )
-  policy_wrapper = _make_policy_wrapper(teacher_make_policy, student_make_policy)
+  policy_wrapper = _make_policy_wrapper(
+      teacher_make_policy, student_make_policy
+  )
 
   teacher_base_optimizer = optax.adam(learning_rate=learning_rate)
   lr_schedule = learning_rate_schedule or ppo_optimizer.LRSchedule.NONE
@@ -434,14 +438,16 @@ def train(
       unused_key: PRNGKey,
   ):
     del unused_key
-    logits = l2t_net.student_policy.apply(normalizer_params, params, data.observation)
+    logits = l2t_net.student_policy.apply(
+        normalizer_params, params, data.observation
+    )
     student_actions = l2t_net.student_distribution.mode(logits)
     diff = student_actions - data.action
     mse = jnp.mean(jnp.square(diff))
     loss = student_bc_weight * mse
     metrics = {
-      'bc_loss': loss,
-      'action_mse': mse,
+        'bc_loss': loss,
+        'action_mse': mse,
     }
     return loss, metrics
 
@@ -534,13 +540,15 @@ def train(
 
     shuffled_data = jax.tree_util.tree_map(convert_data, sgd_data)
 
-    (teacher_optimizer_state, teacher_params, _), teacher_metrics = jax.lax.scan(
-        functools.partial(
-            teacher_minibatch_step, normalizer_params=teacher_norm
-        ),
-        (teacher_optimizer_state, teacher_params, key_grad),
-        shuffled_data,
-        length=num_minibatches,
+    (teacher_optimizer_state, teacher_params, _), teacher_metrics = (
+        jax.lax.scan(
+            functools.partial(
+                teacher_minibatch_step, normalizer_params=teacher_norm
+            ),
+            (teacher_optimizer_state, teacher_params, key_grad),
+            shuffled_data,
+            length=num_minibatches,
+        )
     )
 
     (student_optimizer_state, student_params), student_metrics = jax.lax.scan(
@@ -552,9 +560,7 @@ def train(
         length=num_minibatches,
     )
 
-    student_metrics = {
-        f'student/{k}': v for k, v in student_metrics.items()
-    }
+    student_metrics = {f'student/{k}': v for k, v in student_metrics.items()}
     metrics = {**teacher_metrics, **student_metrics}
 
     return (
@@ -571,13 +577,11 @@ def train(
     training_state, state, key = carry
     key_sgd, key_generate_unroll, new_key = jax.random.split(key, 3)
 
-    teacher_policy = teacher_make_policy(
-        (
-            training_state.teacher.normalizer_params,
-            training_state.teacher.params.policy,
-            training_state.teacher.params.value,
-        )
-    )
+    teacher_policy = teacher_make_policy((
+        training_state.teacher.normalizer_params,
+        training_state.teacher.params.policy,
+        training_state.teacher.params.value,
+    ))
 
     def f(carry, unused_t):
       current_state, current_key = carry
@@ -747,7 +751,9 @@ def train(
 
   if restore_checkpoint_path is not None:
     restored = l2t_checkpoint.load(restore_checkpoint_path)
-    teacher_value = restored[0][2] if restore_value_fn else teacher_init_params.value
+    teacher_value = (
+        restored[0][2] if restore_value_fn else teacher_init_params.value
+    )
     init_training_state = init_training_state.replace(
         teacher=init_training_state.teacher.replace(
             normalizer_params=restored[0][0],
@@ -886,7 +892,8 @@ def train(
   total_steps = current_step
   if total_steps < num_timesteps:
     raise AssertionError(
-        f'Total steps {total_steps} is less than `num_timesteps`={num_timesteps}.'
+        f'Total steps {total_steps} is less than'
+        f' `num_timesteps`={num_timesteps}.'
     )
   pmap.assert_is_replicated(training_state)
   params = _unpmap(_pack_params(training_state))
@@ -910,13 +917,11 @@ def _make_policy_wrapper(
   ) -> types.Policy:
     teacher_params, student_params = params
     if agent == 'teacher':
-      return teacher_make_policy_fn(
-          teacher_params, deterministic=deterministic
-      )
+      return teacher_make_policy_fn(teacher_params, deterministic=deterministic)
     if agent == 'student':
-      return student_make_policy_fn(
-          student_params, deterministic=deterministic
-      )
-    raise ValueError(f'Unsupported agent: {agent}. Choose "teacher" or "student".')
+      return student_make_policy_fn(student_params, deterministic=deterministic)
+    raise ValueError(
+        f'Unsupported agent: {agent}. Choose "teacher" or "student".'
+    )
 
   return make_policy
