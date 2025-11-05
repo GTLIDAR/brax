@@ -74,7 +74,16 @@ class TrainingState:
 
 
 def _unpmap(v):
-  return jax.tree_util.tree_map(lambda x: x[0], v)
+  def _unpack(x):
+    # Handle 0-dimensional arrays (scalars)
+    if x.ndim == 0:
+      return x
+    # Handle replicated arrays (first dimension is device dimension)
+    if x.ndim > 0:
+      return x[0]
+    return x
+
+  return jax.tree_util.tree_map(_unpack, v)
 
 
 def _strip_weak_type(tree):
@@ -784,9 +793,10 @@ def train(
     )
 
   if num_timesteps == 0:
+    # When num_timesteps == 0, state is not replicated, so don't use _unpmap
     return (
       policy_wrapper,
-      _unpmap(_pack_params(init_training_state)),
+      _pack_params(init_training_state),
       {},
     )
 
