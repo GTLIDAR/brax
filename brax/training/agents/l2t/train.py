@@ -21,6 +21,12 @@ import time
 from typing import Any, Callable, Mapping, Optional, Tuple, Union
 
 from absl import logging
+import flax
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+
 from brax import base
 from brax import envs
 from brax.training import acting
@@ -37,11 +43,7 @@ from brax.training.agents.ppo import networks as ppo_networks
 from brax.training.agents.ppo import optimizer as ppo_optimizer
 from brax.training.types import Params
 from brax.training.types import PRNGKey
-import flax
-import jax
-import jax.numpy as jnp
-import numpy as np
-import optax
+
 
 InferenceParams = Tuple[  # teacher params, student params
   Tuple[running_statistics.NestedMeanStd, Params, Params],
@@ -294,6 +296,11 @@ def train(
   student_learning_rate: Optional[float] = None,
   student_max_grad_norm: Optional[float] = None,
   student_bc_weight: float = 1.0,
+  student_use_nll_loss: bool = True,
+  student_entropy_cost: float = 0.0,
+  student_use_huber_loss: bool = False,
+  student_huber_delta: float = 1.0,
+  student_match_distribution_params: bool = False,
 ):
   """Runs joint training of a PPO teacher and an L2 imitation student."""
   assert batch_size * num_minibatches % num_envs == 0
@@ -444,19 +451,85 @@ def train(
     data: types.Transition,
     unused_key: PRNGKey,
   ):
-    del unused_key
     logits = l2t_net.student_policy.apply(
       normalizer_params, params, data.observation
     )
+
+    # Action-based losses
     student_actions = l2t_net.student_distribution.mode(logits)
     diff = student_actions - data.action
-    mse = jnp.mean(jnp.square(diff))
-    loss = student_bc_weight * mse
+
+    if student_use_huber_loss:
+      # Huber loss: more robust to outliers than MSE
+      squared_diff = jnp.square(diff)
+      abs_diff = jnp.abs(diff)
+      action_loss = jnp.where(
+        abs_diff < student_huber_delta,
+        0.5 * squared_diff,
+        student_huber_delta * (abs_diff - 0.5 * student_huber_delta),
+      )
+      action_loss = jnp.mean(action_loss)
+    else:
+      # Standard MSE loss
+      action_loss = jnp.mean(jnp.square(diff))
+
+    # Negative log-likelihood loss (more principled for probabilistic policies)
+    # Note: Requires teacher to generate raw_action in policy_extras
+    nll_loss = 0.0
+    if student_use_nll_loss:
+      # Get teacher's raw action (same pattern as PPO losses)
+      teacher_raw_action = data.extras["policy_extras"]["raw_action"]
+      # Use raw action for NLL computation (before postprocessing)
+      nll = -l2t_net.student_distribution.log_prob(logits, teacher_raw_action)
+      nll_loss = jnp.mean(nll)
+
+    # Distribution parameter matching (for better learning of uncertainty)
+    # Note: Requires teacher to generate distribution_params in policy_extras
+    dist_param_loss = 0.0
+    if student_match_distribution_params:
+      student_dist = l2t_net.student_distribution.create_dist(logits)
+      if hasattr(student_dist, "loc") and hasattr(student_dist, "scale"):
+        # Get teacher distribution params
+        teacher_dist_params = data.extras["policy_extras"][
+          "distribution_params"
+        ]
+        teacher_dist = l2t_net.student_distribution.create_dist(
+          teacher_dist_params
+        )
+        if hasattr(teacher_dist, "loc") and hasattr(teacher_dist, "scale"):
+          # Match mean and std separately
+          mean_diff = student_dist.loc - teacher_dist.loc
+          std_diff = student_dist.scale - teacher_dist.scale
+          dist_param_loss = jnp.mean(jnp.square(mean_diff)) + jnp.mean(
+            jnp.square(std_diff)
+          )
+
+    # Entropy regularization (encourage exploration)
+    entropy_loss = 0.0
+    entropy = 0.0
+    if student_entropy_cost > 0.0:
+      entropy = jnp.mean(
+        l2t_net.student_distribution.entropy(logits, unused_key)
+      )
+      entropy_loss = -student_entropy_cost * entropy
+
+    # Combine losses
+    if student_use_nll_loss:
+      bc_loss = nll_loss
+    else:
+      bc_loss = action_loss
+
+    total_loss = student_bc_weight * bc_loss + dist_param_loss + entropy_loss
+
     metrics = {
-      "bc_loss": loss,
-      "action_mse": mse,
+      "bc_loss": total_loss,
+      "action_mse": action_loss,
+      "nll_loss": nll_loss if student_use_nll_loss else jnp.array(0.0),
+      "dist_param_loss": dist_param_loss,
+      "entropy": entropy,
+      "entropy_loss": entropy_loss,
     }
-    return loss, metrics
+    return total_loss, metrics
 
   student_gradient_update_fn = gradients.gradient_update_fn(
     student_loss_fn,
