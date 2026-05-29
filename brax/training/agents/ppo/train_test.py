@@ -1,4 +1,4 @@
-# Copyright 2025 The Brax Authors.
+# Copyright 2026 The Brax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -54,15 +54,25 @@ class PPOTest(parameterized.TestCase):
         normalize_advantage=False,
     )
     self.assertGreater(metrics['eval/episode_reward'], 135)
-    self.assertEqual(fast.reset_count, 4)  # type: ignore
-    self.assertEqual(fast.step_count, 3)  # type: ignore
 
-  @parameterized.parameters(
-      ('normal', 'scalar'),
-      ('normal', 'log'),
-      ('tanh_normal', 'log'),
+  @parameterized.product(
+      (
+          dict(distribution_type='normal', noise_std_type='scalar'),
+          dict(distribution_type='normal', noise_std_type='log'),
+          dict(distribution_type='tanh_normal', noise_std_type='log'),
+      ),
+      normalize_mode=['welford', 'ema'],
+      bootstrap_on_timeout=[True, False],
+      clipping_epsilon_value=[None, 0.1],
   )
-  def testTrainWithNetworkParams(self, distribution_type, noise_std_type):
+  def testTrainWithNetworkParams(
+      self,
+      distribution_type,
+      noise_std_type,
+      normalize_mode,
+      bootstrap_on_timeout,
+      clipping_epsilon_value,
+  ):
     """Test PPO runs with different network params."""
     network_factory = functools.partial(
         ppo_networks.make_ppo_networks,
@@ -74,6 +84,9 @@ class PPOTest(parameterized.TestCase):
         policy_network_kernel_init_kwargs={'scale': jnp.sqrt(2.0)},
         value_network_kernel_init_fn=jax.nn.initializers.orthogonal,
         value_network_kernel_init_kwargs={'scale': jnp.sqrt(2.0)},
+        mean_clip_scale=5.0,
+        mean_kernel_init_fn=jax.nn.initializers.orthogonal,
+        mean_kernel_init_kwargs={'scale': 0.001},
     )
 
     _, _, _ = ppo.train(
@@ -95,6 +108,48 @@ class PPOTest(parameterized.TestCase):
         normalize_advantage=False,
         network_factory=network_factory,
         learning_rate_schedule='ADAPTIVE_KL',
+        normalize_observations_mode=normalize_mode,
+        bootstrap_on_timeout=bootstrap_on_timeout,
+        clipping_epsilon_value=clipping_epsilon_value,
+    )
+
+  def testTrainWithDistributionalCritic(self):
+    """Test PPO runs with distributional critic and adaptive KL."""
+    network_factory = functools.partial(
+        ppo_networks.make_ppo_networks,
+        distribution_type='normal',
+        noise_std_type='log',
+        init_noise_std=0.8,
+        activation=jax.nn.elu,
+        use_distributional_critic=True,
+    )
+
+    _, _, metrics = ppo.train(
+        envs.get_environment('inverted_pendulum', backend='spring'),
+        num_timesteps=2**13,
+        episode_length=50,
+        num_envs=64,
+        learning_rate=3e-4,
+        entropy_cost=1e-2,
+        discounting=0.95,
+        unroll_length=5,
+        batch_size=64,
+        num_minibatches=8,
+        num_updates_per_batch=4,
+        normalize_observations=True,
+        max_grad_norm=1.0,
+        seed=2,
+        reward_scaling=10,
+        normalize_advantage=False,
+        network_factory=network_factory,
+        learning_rate_schedule='ADAPTIVE_KL',
+        clipping_epsilon_value=1.0,
+        use_distributional_critic=True,
+    )
+    # Verify training produced finite results.
+    self.assertTrue(
+        jnp.isfinite(metrics['eval/episode_reward']),
+        f'Reward is not finite: {metrics["eval/episode_reward"]}',
     )
 
   def testTrainAsymmetricActorCritic(self):

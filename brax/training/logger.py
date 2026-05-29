@@ -1,4 +1,4 @@
-# Copyright 2025 The Brax Authors.
+# Copyright 2026 The Brax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 import collections
 import logging
+import time
 from jax import numpy as jnp
 import numpy as np
 
@@ -38,13 +39,17 @@ class EpisodeMetricsLogger:
     self._last_log_steps = 0
     self._log_count = 0
     self._progress_fn = progress_fn
+    self._last_log_time = time.time()
 
   def update_episode_metrics(self, episode_metrics, dones, train_metrics):
     self._num_steps += np.prod(dones.shape)
     if jnp.sum(dones) > 0:
+      lengths = episode_metrics['length'][dones.astype(bool)].flatten()
       for name, metric in episode_metrics.items():
-        done_metrics = metric[dones.astype(bool)].flatten().tolist()
-        self._ep_metrics_buffer[name].extend(done_metrics)
+        done_metrics = metric[dones.astype(bool)].flatten()
+        if name.endswith('_per_step'):
+          done_metrics = done_metrics / (lengths + 1e-8)
+        self._ep_metrics_buffer[name].extend(done_metrics.tolist())
     for name, metric in train_metrics.items():
       self._train_metrics_buffer[name].extend(metric.flatten().tolist())
     if self._num_steps - self._last_log_steps >= self._steps_between_logging:
@@ -54,10 +59,16 @@ class EpisodeMetricsLogger:
   def log_metrics(self, pad=35):
     """Log metrics to console."""
     self._log_count += 1
+    now = time.time()
+    steps_per_second = (self._num_steps - self._last_log_steps) / (
+        now - self._last_log_time + 1e-8
+    )
+    self._last_log_time = now
     log_string = (
         f"\n{'Steps':>{pad}} Env: {self._num_steps} Log: {self._log_count}\n"
     )
-    mean_metrics = {}
+    mean_metrics = {'sps': steps_per_second}
+    log_string += f"{'Steps per second:':>{pad}} {steps_per_second:.0f}\n"
     for metric_name in self._ep_metrics_buffer:
       mean_metrics[metric_name] = np.mean(self._ep_metrics_buffer[metric_name])
       log_string += (

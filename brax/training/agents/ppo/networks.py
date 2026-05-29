@@ -1,4 +1,4 @@
-# Copyright 2025 The Brax Authors.
+# Copyright 2026 The Brax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,8 +32,18 @@ class PPONetworks:
   parametric_action_distribution: distribution.ParametricDistribution
 
 
-def make_inference_fn(ppo_networks: PPONetworks):
-  """Creates params and inference function for the PPO agent."""
+def make_inference_fn(
+    ppo_networks: PPONetworks,
+    compute_value: bool = False,
+    use_distributional_critic: bool = False,
+):
+  """Creates params and inference function for the PPO agent.
+
+  Args:
+    ppo_networks: The PPO networks.
+    compute_value: If True, compute value during rollouts.
+    use_distributional_critic: If True, value network returns (v, quantiles).
+  """
 
   def make_policy(
       params: types.Params, deterministic: bool = False
@@ -55,11 +65,23 @@ def make_inference_fn(ppo_networks: PPONetworks):
       postprocessed_actions = parametric_action_distribution.postprocess(
           raw_actions
       )
-      return postprocessed_actions, {
+      extras = {
           'log_prob': log_prob,
           'raw_action': raw_actions,
           'distribution_params': logits,
       }
+      if compute_value:
+        if use_distributional_critic:
+          v_estimate, quantiles = ppo_networks.value_network.apply(
+              params[0], params[2], observations
+          )
+          extras['value'] = v_estimate
+          extras['quantiles'] = quantiles
+        else:
+          extras['value'] = ppo_networks.value_network.apply(
+              params[0], params[2], observations
+          )
+      return postprocessed_actions, extras
 
     return policy
 
@@ -83,10 +105,16 @@ def make_ppo_networks(
     policy_network_kernel_init_kwargs: Mapping[str, Any] | None = None,
     value_network_kernel_init_fn: networks.Initializer = jax.nn.initializers.lecun_uniform,
     value_network_kernel_init_kwargs: Mapping[str, Any] | None = None,
+    mean_clip_scale: float | None = None,
+    mean_kernel_init_fn: networks.Initializer | None = None,
+    mean_kernel_init_kwargs: Mapping[str, Any] | None = None,
+    use_distributional_critic: bool = False,
+    num_quantiles: int = 32,
 ) -> PPONetworks:
   """Make PPO networks with preprocessor."""
   policy_kernel_init_kwargs = policy_network_kernel_init_kwargs or {}
   value_kernel_init_kwargs = value_network_kernel_init_kwargs or {}
+  mean_kernel_init_kwargs_ = mean_kernel_init_kwargs or {}
 
   parametric_action_distribution: distribution.ParametricDistribution
   if distribution_type == 'normal':
@@ -114,6 +142,11 @@ def make_ppo_networks(
       init_noise_std=init_noise_std,
       state_dependent_std=state_dependent_std,
       kernel_init=policy_network_kernel_init_fn(**policy_kernel_init_kwargs),
+      mean_clip_scale=mean_clip_scale,
+      mean_kernel_init=(
+          mean_kernel_init_fn(**mean_kernel_init_kwargs_)
+          if mean_kernel_init_fn is not None else None
+      ),
   )
   value_network = networks.make_value_network(
       observation_size,
@@ -122,6 +155,8 @@ def make_ppo_networks(
       activation=activation,
       obs_key=value_obs_key,
       kernel_init=value_network_kernel_init_fn(**value_kernel_init_kwargs),
+      use_distributional_critic=use_distributional_critic,
+      num_quantiles=num_quantiles,
   )
 
   return PPONetworks(

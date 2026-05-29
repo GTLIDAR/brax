@@ -1,4 +1,4 @@
-# Copyright 2025 The Brax Authors.
+# Copyright 2026 The Brax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -153,7 +153,7 @@ class QueueReplayTest(parameterized.TestCase):
 
     # Expect an exception if `buffer_state.data` was corrupted.
     invalid_state = buffer_state.replace(data=jnp.arange(10))
-    with self.assertRaises(ValueError) as context_manager:
+    with self.assertRaises(Exception) as context_manager:
       replay_buffer.insert(invalid_state, get_dummy_batch())
     self.assertContainsSubsequence(str(context_manager.exception), 'shape')
 

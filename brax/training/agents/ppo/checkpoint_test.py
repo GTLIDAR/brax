@@ -1,4 +1,4 @@
-# Copyright 2025 The Brax Authors.
+# Copyright 2026 The Brax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -61,6 +61,9 @@ class CheckpointTest(absltest.TestCase):
         policy_network_kernel_init_fn=jax.nn.initializers.orthogonal,
         policy_network_kernel_init_kwargs={"scale": jp.sqrt(2.0)},
         value_network_kernel_init_fn=jax.nn.initializers.glorot_uniform,
+        mean_clip_scale=5.0,
+        mean_kernel_init_fn=jax.nn.initializers.orthogonal,
+        mean_kernel_init_kwargs={"scale": 0.001},
     )
     config = checkpoint.network_config(
         observation_size=1,
@@ -85,7 +88,8 @@ class CheckpointTest(absltest.TestCase):
         value=ppo_network.value_network.init(dummy_key),
     )
     normalizer_params = running_statistics.init_state(
-        jax.tree_util.tree_map(jp.zeros, config.observation_size)
+        jax.tree_util.tree_map(jp.zeros, config.observation_size),
+        std_eps=0.02,
     )
     params = (normalizer_params, network_params.policy, network_params.value)
 
@@ -102,6 +106,10 @@ class CheckpointTest(absltest.TestCase):
     )
     out = policy_fn(jp.zeros(1), jax.random.PRNGKey(0))
     self.assertEqual(out[0].shape, (3,))
+
+    loaded_params = checkpoint.load(epath.Path(path.full_path) / "000000000001")
+    loaded_normalizer = loaded_params[0]
+    self.assertEqual(loaded_normalizer.std_eps, 0.02)
 
 
 if __name__ == "__main__":

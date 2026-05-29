@@ -1,4 +1,4 @@
-# Copyright 2025 The Brax Authors.
+# Copyright 2026 The Brax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -114,14 +114,14 @@ class EpisodeWrapper(Wrapper):
 
     # Aggregate state metrics into episode metrics
     prev_done = state.info['episode_done']
-    state.info['episode_metrics']['sum_reward'] += jp.sum(rewards, axis=0)
     state.info['episode_metrics']['sum_reward'] *= (1 - prev_done)
-    state.info['episode_metrics']['length'] += self.action_repeat
+    state.info['episode_metrics']['sum_reward'] += jp.sum(rewards, axis=0)
     state.info['episode_metrics']['length'] *= (1 - prev_done)
+    state.info['episode_metrics']['length'] += self.action_repeat
     for metric_name in state.metrics.keys():
       if metric_name != 'reward':
-        state.info['episode_metrics'][metric_name] += state.metrics[metric_name]
         state.info['episode_metrics'][metric_name] *= (1 - prev_done)
+        state.info['episode_metrics'][metric_name] += state.metrics[metric_name]
     state.info['episode_done'] = done
     return state.replace(done=done)
 

@@ -1,4 +1,4 @@
-# Copyright 2025 The Brax Authors.
+# Copyright 2026 The Brax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,12 +19,28 @@ This file was taken from acme and modified to simplify dependencies:
 https://github.com/deepmind/acme/blob/master/acme/jax/running_statistics.py
 """
 
-from typing import Any, Optional, Tuple
+import enum
+from typing import Optional, Tuple, Union
 
+from brax.training import types as training_types
 from brax.training.acme import types
 from flax import struct
 import jax
 import jax.numpy as jnp
+
+
+class NormalizationMode(enum.IntEnum):
+  WELFORD = 0
+  EMA = 1
+
+
+def _mode_from_string(mode: str) -> int:
+  if mode == 'ema':
+    return NormalizationMode.EMA
+  elif mode == 'welford':
+    return NormalizationMode.WELFORD
+  else:
+    raise ValueError(f'Unknown normalization mode: {mode}')
 
 
 def _zeros_like(nest: types.Nest, dtype=None) -> types.Nest:
@@ -45,21 +61,35 @@ class NestedMeanStd:
 @struct.dataclass
 class RunningStatisticsState(NestedMeanStd):
   """Full state of running statistics computation."""
-  count: jnp.ndarray
+  count: Union[jnp.ndarray, training_types.UInt64]
   summed_variance: types.Nest
+  std_eps: float = 0.0
+  mode: int = struct.field(pytree_node=False, default=NormalizationMode.WELFORD)
 
 
-def init_state(nest: types.Nest) -> RunningStatisticsState:
-  """Initializes the running statistics for the given nested structure."""
+def init_state(
+    nest: types.Nest,
+    std_eps: float = 0.0,
+    mode: str = 'welford',
+) -> RunningStatisticsState:
+  """Initializes the running statistics for the given nested structure.
+
+  Args:
+    nest: Nested structure to initialize statistics for.
+    std_eps: Epsilon for numerical stability when getting std.
+    mode: Normalization mode - 'welford' (default) or 'ema'.
+  """
   dtype = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
+  mode_int = _mode_from_string(mode)
 
   return RunningStatisticsState(
-      count=jnp.zeros((), dtype=dtype),
+      count=training_types.UInt64(hi=0, lo=0),
       mean=_zeros_like(nest, dtype=dtype),
       summed_variance=_zeros_like(nest, dtype=dtype),
-      # Initialize with ones to make sure normalization works correctly
-      # in the initial state.
-      std=_ones_like(nest, dtype=dtype))
+      std=_ones_like(nest, dtype=dtype),
+      std_eps=std_eps,
+      mode=mode_int,
+  )
 
 
 def _validate_batch_shapes(batch: types.NestedArray,
@@ -94,15 +124,16 @@ def update(state: RunningStatisticsState,
            std_min_value: float = 1e-6,
            std_max_value: float = 1e6,
            pmap_axis_name: Optional[str] = None,
-           validate_shapes: bool = True) -> RunningStatisticsState:
+           validate_shapes: bool = True,
+           until_count: Optional[int] = None) -> RunningStatisticsState:
   """Updates the running statistics with the given batch of data.
 
   Note: data batch and state elements (mean, etc.) must have the same structure.
 
-  Note: by default will use int32 for counts and float32 for accumulated
-  variance. This results in an integer overflow after 2^31 data points and
-  degrading precision after 2^24 batch updates or even earlier if variance
-  updates have large dynamic range.
+  Note: by default uses UInt64 for counts that get converted to float32 for division.
+  This conversion has a small precision loss for large counts. float32 is used
+  to accumulate variance, so can also suffer from precision loss due to the 24 bit
+  mantissa for float32.
   To improve precision, consider setting jax_enable_x64 to True, see
   https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html#double-64bit-precision
 
@@ -117,6 +148,8 @@ def update(state: RunningStatisticsState,
     pmap_axis_name: Name of the pmapped axis, if any.
     validate_shapes: If true, the shapes of all leaves of the batch will be
       validated. Enabled by default. Doesn't impact performance when jitted.
+    until_count: If not None, the update will be skipped if the count is more
+      than this value.
 
   Returns:
     Updated running statistics.
@@ -133,12 +166,20 @@ def update(state: RunningStatisticsState,
                            jax.tree_util.tree_leaves(state.mean)[0].ndim]
   batch_axis = range(len(batch_dims))
   if weights is None:
-    step_increment = jnp.prod(jnp.array(batch_dims))
+    step_increment = jnp.prod(jnp.array(batch_dims)).astype(jnp.int32)
   else:
-    step_increment = jnp.sum(weights)
+    step_increment = jnp.sum(weights).astype(jnp.int32)
   if pmap_axis_name is not None:
     step_increment = jax.lax.psum(step_increment, axis_name=pmap_axis_name)
   count = state.count + step_increment
+
+  if isinstance(count, training_types.UInt64):
+    # Convert UInt64 count to float32 for division operations.
+    # Note: small precision loss due to float32's 24-bit mantissa.
+    count_float = (jnp.float32(count.hi) * jnp.float32(2.0**32) +
+                   jnp.float32(count.lo))
+  else:
+    count_float = jnp.float32(count)
 
   # Validation is important. If the shapes don't match exactly, but are
   # compatible, arrays will be silently broadcasted resulting in incorrect
@@ -148,6 +189,60 @@ def update(state: RunningStatisticsState,
       if weights.shape != batch_dims:
         raise ValueError(f'{weights.shape} != {batch_dims}')
     _validate_batch_shapes(batch, state.mean, batch_dims)
+
+  if state.mode == NormalizationMode.EMA:
+    # RSL-RL's EmpiricalNormalization algorithm uses
+    # rate = batch_size / total_count instead of fixed alpha.
+    rate = jnp.float32(step_increment) / count_float
+    if until_count is not None:
+      rate = jnp.where(count_float > until_count, 0.0, rate)
+
+    def _compute_ema_statistics(
+        mean: jnp.ndarray,
+        variance: jnp.ndarray,
+        batch: jnp.ndarray,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+      batch_mean = jnp.mean(batch, axis=batch_axis)
+      batch_var = jnp.var(batch, axis=batch_axis)
+      if pmap_axis_name is not None:
+        batch_mean = jax.lax.pmean(batch_mean, axis_name=pmap_axis_name)
+        batch_var = jax.lax.pmean(batch_var, axis_name=pmap_axis_name)
+      delta_mean = batch_mean - mean
+      new_mean = mean + rate * delta_mean
+      new_variance = variance + rate * (
+          batch_var - variance + delta_mean * (batch_mean - new_mean)
+      )
+      return new_mean, new_variance
+
+    updated_stats = jax.tree_util.tree_map(
+        _compute_ema_statistics,
+        state.mean,
+        state.summed_variance,
+        batch,
+    )
+    mean = jax.tree_util.tree_map(lambda _, x: x[0], state.mean, updated_stats)
+    variance = jax.tree_util.tree_map(
+        lambda _, x: x[1], state.mean, updated_stats
+    )
+
+    def compute_ema_std(
+        variance: jnp.ndarray, _std: jnp.ndarray
+    ) -> jnp.ndarray:
+      variance = jnp.maximum(variance, 0)
+      std = jnp.sqrt(variance + state.std_eps)
+      std = jnp.clip(std, std_min_value, std_max_value)
+      return std
+
+    std = jax.tree_util.tree_map(compute_ema_std, variance, state.std)
+
+    return RunningStatisticsState(
+        count=count,
+        mean=mean,
+        summed_variance=variance,
+        std=std,
+        std_eps=state.std_eps,
+        mode=state.mode,
+    )
 
   def _compute_node_statistics(
       mean: jnp.ndarray, summed_variance: jnp.ndarray,
@@ -162,7 +257,7 @@ def update(state: RunningStatisticsState,
           weights,
           list(weights.shape) + [1] * (batch.ndim - weights.ndim))
       diff_to_old_mean = diff_to_old_mean * expanded_weights
-    mean_update = jnp.sum(diff_to_old_mean, axis=batch_axis) / count
+    mean_update = jnp.sum(diff_to_old_mean, axis=batch_axis) / count_float
     if pmap_axis_name is not None:
       mean_update = jax.lax.psum(
           mean_update, axis_name=pmap_axis_name)
@@ -188,14 +283,20 @@ def update(state: RunningStatisticsState,
     assert isinstance(summed_variance, jnp.ndarray)
     # Summed variance can get negative due to rounding errors.
     summed_variance = jnp.maximum(summed_variance, 0)
-    std = jnp.sqrt(summed_variance / count)
+    std = jnp.sqrt(summed_variance / count_float + state.std_eps)
     std = jnp.clip(std, std_min_value, std_max_value)
     return std
 
   std = jax.tree_util.tree_map(compute_std, summed_variance, state.std)
 
   return RunningStatisticsState(
-      count=count, mean=mean, summed_variance=summed_variance, std=std)
+      count=count,
+      mean=mean,
+      summed_variance=summed_variance,
+      std=std,
+      std_eps=state.std_eps,
+      mode=state.mode,
+  )
 
 
 def normalize(batch: types.NestedArray,

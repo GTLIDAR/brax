@@ -1,4 +1,4 @@
-# Copyright 2025 The Brax Authors.
+# Copyright 2026 The Brax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,6 +37,7 @@ _KERNEL_INIT_FN_KEYWORDS = (
     'policy_network_kernel_init_fn',
     'value_network_kernel_init_fn',
     'q_network_kernel_init_fn',
+    'mean_kernel_init_fn',
 )
 
 
@@ -161,6 +162,8 @@ def save(
   for init_fn_name in _KERNEL_INIT_FN_KEYWORDS:
     if init_fn_name not in config_cp_dict['network_factory_kwargs']:
       continue
+    if config_cp_dict['network_factory_kwargs'][init_fn_name] is None:
+      continue
     name_ = config_cp_dict['network_factory_kwargs'][init_fn_name].__name__
     if name_ not in networks.KERNEL_INITIALIZER:
       raise ValueError(
@@ -193,7 +196,12 @@ def load(
   target = orbax_checkpointer.restore(
       path, ocp.args.PyTreeRestore(restore_args=restore_args), item=None
   )
-  target[0] = running_statistics.RunningStatisticsState(**target[0])
+
+  # Reconstruct UInt64 count if it was saved as dict.
+  state_dict = target[0]
+  if isinstance(state_dict['count'], dict) and 'hi' in state_dict['count']:
+    state_dict['count'] = types.UInt64(**state_dict['count'])
+  target[0] = running_statistics.RunningStatisticsState(**state_dict)
 
   return target
 
