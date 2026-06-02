@@ -52,6 +52,7 @@ InferenceParams = Tuple[  # teacher params, student params
 Metrics = types.Metrics
 
 _PMAP_AXIS_NAME = "i"
+_MIXED_ACTION_LOG_PROB_FLOOR = -jnp.inf
 
 
 @flax.struct.dataclass
@@ -188,6 +189,64 @@ def _remove_pixels(
   return {k: v for k, v in obs.items() if not k.startswith("pixels/")}
 
 
+def _batch_size_from_observation(observation: types.Observation) -> int:
+  leaves = jax.tree_util.tree_leaves(observation)
+  if not leaves:
+    raise ValueError("Cannot infer batch size from an empty observation tree.")
+  return leaves[0].shape[0]
+
+
+def _where_with_batch_mask(
+  mask: jax.Array, teacher_value: jax.Array, student_value: jax.Array
+) -> jax.Array:
+  while mask.ndim < teacher_value.ndim:
+    mask = mask[..., None]
+  return jnp.where(mask, teacher_value, student_value)
+
+
+def _uint64_to_float(value: types.UInt64) -> jax.Array:
+  hi = jnp.asarray(value.hi, dtype=jnp.float32)
+  lo = jnp.asarray(value.lo, dtype=jnp.float32)
+  return hi * (2.0**32) + lo
+
+
+def _merge_l2t_eval_metrics(
+  teacher_metrics: Metrics,
+  student_metrics: Metrics,
+  training_metrics: Metrics,
+  teacher_num_eval_envs: int,
+  student_num_eval_envs: int,
+  episode_length: Optional[int],
+  num_eval_envs: int,
+) -> Metrics:
+  metrics = dict(training_metrics)
+  teacher_eval_metrics = {
+    k: v for k, v in teacher_metrics.items() if k.startswith("eval/")
+  }
+  student_eval_metrics = {
+    k: v for k, v in student_metrics.items() if k.startswith("eval/")
+  }
+  for key, value in teacher_eval_metrics.items():
+    metrics[f"eval/teacher/{key[len('eval/'):]}"] = value
+  for key, value in student_eval_metrics.items():
+    metrics[f"eval/student/{key[len('eval/'):]}"] = value
+
+  for key, teacher_value in teacher_eval_metrics.items():
+    if key not in student_eval_metrics:
+      continue
+    student_value = student_eval_metrics[key]
+    if key in ("eval/walltime", "eval/epoch_eval_time"):
+      metrics[key] = teacher_value + student_value
+    elif key != "eval/sps":
+      metrics[key] = 0.5 * (teacher_value + student_value)
+  epoch_eval_time = metrics.get("eval/epoch_eval_time")
+  if epoch_eval_time is not None and episode_length is not None:
+    metrics["eval/sps"] = episode_length * num_eval_envs / epoch_eval_time
+  metrics["eval/teacher/num_envs"] = teacher_num_eval_envs
+  metrics["eval/student/num_envs"] = student_num_eval_envs
+  return metrics
+
+
 def _make_student_inference_fn(
   student_network: types.NetworkFactory[Any],
   student_distribution: Any,
@@ -278,7 +337,7 @@ def train(
   # eval
   num_evals: int = 1,
   eval_env: Optional[envs.Env] = None,
-  num_eval_envs: int = 128,
+  num_eval_envs: int = 256,
   deterministic_eval: bool = False,
   # training metrics
   log_training_metrics: bool = False,
@@ -289,6 +348,7 @@ def train(
   # checkpointing / restoring
   save_checkpoint_path: Optional[str] = None,
   restore_checkpoint_path: Optional[str] = None,
+  restore_teacher_params: Optional[Any] = None,
   restore_params: Optional[Any] = None,
   restore_value_fn: bool = True,
   run_evals: bool = True,
@@ -300,10 +360,31 @@ def train(
   student_entropy_cost: float = 0.0,
   student_use_huber_loss: bool = False,
   student_huber_delta: float = 1.0,
+  student_action_mse_weight: float = 0.0,
   student_match_distribution_params: bool = False,
+  student_ppo_weight: float = 0.0,
+  student_clone_teacher_mode: bool = True,
+  teacher_sampling_start_probability: float = 1.0,
+  teacher_sampling_end_probability: float = 0.8,
+  teacher_sampling_warmup_steps: int = 0,
 ):
   """Runs joint training of a PPO teacher and an L2 imitation student."""
   assert batch_size * num_minibatches % num_envs == 0
+  if run_evals and num_evals > 0:
+    if num_eval_envs < 2:
+      raise ValueError("L2T eval requires at least 2 envs to split agents.")
+    if num_eval_envs % 2:
+      raise ValueError("L2T eval requires an even num_eval_envs.")
+  if not 0.0 <= teacher_sampling_start_probability <= 1.0:
+    raise ValueError("teacher_sampling_start_probability must be in [0, 1].")
+  if not 0.0 <= teacher_sampling_end_probability <= 1.0:
+    raise ValueError("teacher_sampling_end_probability must be in [0, 1].")
+  if teacher_sampling_warmup_steps < 0:
+    raise ValueError("teacher_sampling_warmup_steps must be non-negative.")
+  if student_action_mse_weight < 0.0:
+    raise ValueError("student_action_mse_weight must be non-negative.")
+  if student_ppo_weight < 0.0:
+    raise ValueError("student_ppo_weight must be non-negative.")
   _validate_madrona_args(
     madrona_backend, num_envs, num_eval_envs, action_repeat, eval_env
   )
@@ -344,9 +425,10 @@ def train(
   global_key, local_key = jax.random.split(key)
   local_key = jax.random.fold_in(local_key, process_id)
   local_key, key_env, eval_key = jax.random.split(local_key, 3)
-  key_teacher_policy, key_teacher_value, key_student_policy = jax.random.split(
-    global_key, 3
-  )
+  # Keep the teacher initialization bit-for-bit aligned with PPO for the same
+  # seed.  The student gets an independent key derived after the PPO split.
+  key_teacher_policy, key_teacher_value = jax.random.split(global_key)
+  key_student_policy = jax.random.fold_in(global_key, 1)
 
   assert num_envs % device_count == 0
 
@@ -365,6 +447,9 @@ def train(
   def reset_fn_donated_env_state(env_state_donated, key_envs):
     return env.reset(key_envs)
 
+  def vmap_reset_fn_donated_env_state(env_state_donated, key_envs):
+    return jax.vmap(env.reset)(key_envs)
+
   key_envs = jax.random.split(key_env, num_envs // process_count)
   key_envs = jnp.reshape(
     key_envs, (local_devices_to_use, -1) + key_envs.shape[1:]
@@ -381,7 +466,7 @@ def train(
     reset_fn_ = jax.jit(jax.vmap(env.reset))
     env_state = reset_fn_(key_envs)
     reset_fn = jax.jit(
-      reset_fn_donated_env_state, donate_argnums=(0,), keep_unused=True
+      vmap_reset_fn_donated_env_state, donate_argnums=(0,), keep_unused=True
     )
 
   obs_shape = jax.tree_util.tree_map(lambda x: x.shape[2:], env_state.obs)
@@ -438,26 +523,30 @@ def train(
     vf_coefficient=vf_loss_coefficient,
   )
 
-  teacher_gradient_update_fn = gradients.gradient_update_fn(
-    teacher_loss_fn,
-    teacher_optimizer,
-    pmap_axis_name=_PMAP_AXIS_NAME,
-    has_aux=True,
+  teacher_loss_and_pgrad_fn = gradients.loss_and_pgrad(
+    teacher_loss_fn, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
   )
 
   def student_loss_fn(
     params: Params,
     normalizer_params: running_statistics.RunningStatisticsState,
     data: types.Transition,
-    unused_key: PRNGKey,
+    key_loss: PRNGKey,
+    teacher_normalizer_params: running_statistics.RunningStatisticsState,
+    teacher_value_params: Params,
   ):
     logits = l2t_net.student_policy.apply(
       normalizer_params, params, data.observation
     )
 
+    policy_extras = data.extras["policy_extras"]
+    teacher_action = policy_extras.get("teacher_action", data.action)
+    if student_clone_teacher_mode:
+      teacher_action = policy_extras.get("teacher_mode_action", teacher_action)
+
     # Action-based losses
     student_actions = l2t_net.student_distribution.mode(logits)
-    diff = student_actions - data.action
+    diff = student_actions - teacher_action
 
     if student_use_huber_loss:
       # Huber loss: more robust to outliers than MSE
@@ -477,8 +566,13 @@ def train(
     # Note: Requires teacher to generate raw_action in policy_extras
     nll_loss = 0.0
     if student_use_nll_loss:
-      # Get teacher's raw action (same pattern as PPO losses)
-      teacher_raw_action = data.extras["policy_extras"]["raw_action"]
+      teacher_raw_action = policy_extras.get(
+        "teacher_raw_action", policy_extras["raw_action"]
+      )
+      if student_clone_teacher_mode:
+        teacher_raw_action = policy_extras.get(
+          "teacher_mode_raw_action", teacher_raw_action
+        )
       # Use raw action for NLL computation (before postprocessing)
       nll = -l2t_net.student_distribution.log_prob(logits, teacher_raw_action)
       nll_loss = jnp.mean(nll)
@@ -490,9 +584,7 @@ def train(
       student_dist = l2t_net.student_distribution.create_dist(logits)
       if hasattr(student_dist, "loc") and hasattr(student_dist, "scale"):
         # Get teacher distribution params
-        teacher_dist_params = data.extras["policy_extras"][
-          "distribution_params"
-        ]
+        teacher_dist_params = policy_extras["distribution_params"]
         teacher_dist = l2t_net.student_distribution.create_dist(
           teacher_dist_params
         )
@@ -509,7 +601,7 @@ def train(
     entropy = 0.0
     if student_entropy_cost > 0.0:
       entropy = jnp.mean(
-        l2t_net.student_distribution.entropy(logits, unused_key)
+        l2t_net.student_distribution.entropy(logits, key_loss)
       )
       entropy_loss = -student_entropy_cost * entropy
 
@@ -518,16 +610,97 @@ def train(
       bc_loss = nll_loss
     else:
       bc_loss = action_loss
+    action_mse_loss = student_action_mse_weight * action_loss
 
-    total_loss = student_bc_weight * bc_loss + dist_param_loss + entropy_loss
+    ppo_actor_loss = jnp.array(0.0)
+    ppo_entropy = jnp.array(0.0)
+    ppo_entropy_loss = jnp.array(0.0)
+    ppo_mask_mean = jnp.array(0.0)
+    if student_ppo_weight > 0.0:
+      baseline = l2t_net.teacher.value_network.apply(
+        teacher_normalizer_params, teacher_value_params, data.observation
+      )
+      terminal_obs = jax.tree_util.tree_map(
+        lambda x: x[-1], data.next_observation
+      )
+      bootstrap_value = l2t_net.teacher.value_network.apply(
+        teacher_normalizer_params, teacher_value_params, terminal_obs
+      )
+      baseline = jax.lax.stop_gradient(baseline)
+      bootstrap_value = jax.lax.stop_gradient(bootstrap_value)
+      rewards = data.reward * reward_scaling
+      truncation = data.extras["state_extras"]["truncation"]
+      termination = (1 - data.discount) * (1 - truncation)
+      _, advantages = ppo_losses.compute_gae(
+        truncation=truncation,
+        termination=termination,
+        rewards=rewards,
+        values=baseline,
+        bootstrap_value=bootstrap_value,
+        lambda_=gae_lambda,
+        discount=discounting,
+      )
+      if normalize_advantage:
+        advantages = (advantages - advantages.mean()) / (
+          advantages.std() + 1e-8
+        )
+      selected_branch_log_prob = policy_extras.get(
+        "branch_log_prob", policy_extras["log_prob"]
+      )
+      target_action_log_probs = l2t_net.student_distribution.log_prob(
+        logits, policy_extras["raw_action"]
+      )
+      log_rho_s = target_action_log_probs - selected_branch_log_prob
+      log_rho_s = jnp.nan_to_num(
+        log_rho_s, nan=0.0, neginf=-20.0, posinf=20.0
+      )
+      log_rho_s = jnp.clip(log_rho_s, -20.0, 20.0)
+      rho_s = jnp.exp(log_rho_s)
+      surrogate_loss1 = rho_s * advantages
+      surrogate_loss2 = (
+        jnp.clip(rho_s, 1 - clipping_epsilon, 1 + clipping_epsilon)
+        * advantages
+      )
+      surrogate_loss = jnp.minimum(surrogate_loss1, surrogate_loss2)
+      student_policy_mask = 1.0 - policy_extras.get(
+        "sampled_teacher", jnp.ones_like(surrogate_loss)
+      )
+      student_policy_mask = student_policy_mask.astype(surrogate_loss.dtype)
+      masked_surrogate = jnp.where(
+        student_policy_mask > 0.0, surrogate_loss, 0.0
+      )
+      mask_sum = jnp.sum(student_policy_mask)
+      ppo_actor_loss = -jnp.sum(masked_surrogate) / jnp.maximum(mask_sum, 1.0)
+      student_entropy = l2t_net.student_distribution.entropy(logits, key_loss)
+      masked_entropy = jnp.where(
+        student_policy_mask > 0.0, student_entropy, 0.0
+      )
+      ppo_entropy = jnp.sum(masked_entropy) / jnp.maximum(mask_sum, 1.0)
+      ppo_entropy_loss = -student_entropy_cost * ppo_entropy
+      ppo_mask_mean = jnp.mean(student_policy_mask)
+
+    total_loss = (
+      student_bc_weight * bc_loss
+      + action_mse_loss
+      + dist_param_loss
+      + entropy_loss
+      + student_ppo_weight * (ppo_actor_loss + ppo_entropy_loss)
+    )
 
     metrics = {
-      "bc_loss": total_loss,
+      "total_loss": total_loss,
+      "bc_loss": bc_loss,
       "action_mse": action_loss,
+      "action_mse_loss": action_mse_loss,
+      "action_mse_weight": jnp.array(student_action_mse_weight),
       "nll_loss": nll_loss if student_use_nll_loss else jnp.array(0.0),
       "dist_param_loss": dist_param_loss,
       "entropy": entropy,
       "entropy_loss": entropy_loss,
+      "ppo_actor_loss": ppo_actor_loss,
+      "ppo_entropy": ppo_entropy,
+      "ppo_entropy_loss": ppo_entropy_loss,
+      "ppo_mask_mean": ppo_mask_mean,
     }
     return total_loss, metrics
 
@@ -550,12 +723,8 @@ def train(
   ):
     optimizer_state, params, key = carry
     key, key_loss = jax.random.split(key)
-    (_, metrics), params, optimizer_state = teacher_gradient_update_fn(
-      params,
-      normalizer_params,
-      data,
-      key_loss,
-      optimizer_state=optimizer_state,
+    (_, metrics), grads = teacher_loss_and_pgrad_fn(
+      params, normalizer_params, data, key_loss
     )
     metrics["learning_rate"] = jnp.array(learning_rate, dtype=float)
     if lr_is_adaptive_kl:
@@ -565,12 +734,18 @@ def train(
         optimizer_state, kl_mean, desired_kl
       )
       metrics["learning_rate"] = lr
+    params_update, optimizer_state = teacher_optimizer.update(
+      grads, optimizer_state
+    )
+    params = optax.apply_updates(params, params_update)
     return (optimizer_state, params, key), metrics
 
   def student_minibatch_step(
     carry,
     data: types.Transition,
     normalizer_params: running_statistics.RunningStatisticsState,
+    teacher_normalizer_params: running_statistics.RunningStatisticsState,
+    teacher_value_params: Params,
   ):
     optimizer_state, params = carry
     (_, metrics), params, optimizer_state = student_gradient_update_fn(
@@ -578,10 +753,28 @@ def train(
       normalizer_params,
       data,
       jax.random.PRNGKey(0),
+      teacher_normalizer_params,
+      teacher_value_params,
       optimizer_state=optimizer_state,
     )
     metrics["learning_rate"] = jnp.array(student_lr, dtype=float)
     return (optimizer_state, params), metrics
+
+  def teacher_sample_probability(env_steps: types.UInt64) -> jax.Array:
+    schedule_steps = max(
+      float(num_timesteps - teacher_sampling_warmup_steps), 1.0
+    )
+    scheduled_env_steps = jnp.maximum(
+      _uint64_to_float(env_steps) - float(teacher_sampling_warmup_steps),
+      0.0,
+    )
+    progress = scheduled_env_steps / schedule_steps
+    progress = jnp.clip(progress, 0.0, 1.0)
+    return (
+      teacher_sampling_start_probability
+      + (teacher_sampling_end_probability - teacher_sampling_start_probability)
+      * progress
+    )
 
   def sgd_step(
     carry,
@@ -631,7 +824,12 @@ def train(
     )
 
     (student_optimizer_state, student_params), student_metrics = jax.lax.scan(
-      functools.partial(student_minibatch_step, normalizer_params=student_norm),
+      functools.partial(
+        student_minibatch_step,
+        normalizer_params=student_norm,
+        teacher_normalizer_params=teacher_norm,
+        teacher_value_params=teacher_params.value,
+      ),
       (student_optimizer_state, student_params),
       shuffled_data,
       length=num_minibatches,
@@ -648,12 +846,9 @@ def train(
       student_params,
     ), metrics
 
-  def training_step(
-    carry: Tuple[TrainingState, envs.State, PRNGKey], unused_t
-  ) -> Tuple[Tuple[TrainingState, envs.State, PRNGKey], Metrics]:
-    training_state, state, key = carry
-    key_sgd, key_generate_unroll, new_key = jax.random.split(key, 3)
-
+  def make_mixed_rollout_policy(
+    training_state: TrainingState, probability_teacher: jax.Array
+  ) -> types.Policy:
     teacher_policy = teacher_make_policy(
       (
         training_state.teacher.normalizer_params,
@@ -661,6 +856,142 @@ def train(
         training_state.teacher.params.value,
       )
     )
+    student_policy = student_make_policy(
+      (
+        training_state.student.normalizer_params,
+        training_state.student.params,
+      )
+    )
+
+    def policy(observations: types.Observation, key_sample: PRNGKey):
+      key_teacher, key_student, key_mix = jax.random.split(key_sample, 3)
+      teacher_action, teacher_extras = teacher_policy(
+        observations, key_teacher
+      )
+      student_action, student_extras = student_policy(
+        observations, key_student
+      )
+      batch_size = _batch_size_from_observation(observations)
+      sampled_teacher = jax.random.bernoulli(
+        key_mix, probability_teacher, (batch_size,)
+      )
+      action = _where_with_batch_mask(
+        sampled_teacher, teacher_action, student_action
+      )
+
+      teacher_distribution_params = teacher_extras["distribution_params"]
+      student_distribution_params = student_extras["distribution_params"]
+      teacher_raw_action = teacher_extras["raw_action"]
+      student_raw_action = student_extras["raw_action"]
+      teacher_log_prob_for_teacher_raw = teacher_extras["log_prob"]
+      student_log_prob_for_student_raw = student_extras["log_prob"]
+      teacher_mode_raw_action = (
+        l2t_net.teacher.parametric_action_distribution.create_dist(
+          teacher_distribution_params
+        ).mode()
+      )
+      teacher_mode_action = (
+        l2t_net.teacher.parametric_action_distribution.postprocess(
+          teacher_mode_raw_action
+        )
+      )
+      teacher_log_prob_for_student_raw = (
+        l2t_net.teacher.parametric_action_distribution.log_prob(
+          teacher_distribution_params, student_raw_action
+        )
+      )
+      student_log_prob_for_teacher_raw = (
+        l2t_net.student_distribution.log_prob(
+          student_distribution_params, teacher_raw_action
+        )
+      )
+
+      def clean_log_prob(log_prob: jax.Array) -> jax.Array:
+        return jnp.where(
+          jnp.isfinite(log_prob), log_prob, _MIXED_ACTION_LOG_PROB_FLOOR
+        )
+
+      teacher_log_prob_for_teacher_raw = clean_log_prob(
+        teacher_log_prob_for_teacher_raw
+      )
+      student_log_prob_for_student_raw = clean_log_prob(
+        student_log_prob_for_student_raw
+      )
+      teacher_log_prob_for_student_raw = clean_log_prob(
+        teacher_log_prob_for_student_raw
+      )
+      student_log_prob_for_teacher_raw = clean_log_prob(
+        student_log_prob_for_teacher_raw
+      )
+      branch_log_prob = jnp.where(
+        sampled_teacher,
+        teacher_log_prob_for_teacher_raw,
+        student_log_prob_for_student_raw,
+      )
+      selected_teacher_log_prob = jnp.where(
+        sampled_teacher,
+        teacher_log_prob_for_teacher_raw,
+        teacher_log_prob_for_student_raw,
+      )
+      selected_student_log_prob = jnp.where(
+        sampled_teacher,
+        student_log_prob_for_teacher_raw,
+        student_log_prob_for_student_raw,
+      )
+      log_teacher_weight = jnp.log(probability_teacher)
+      log_student_weight = jnp.log1p(-probability_teacher)
+      behavior_log_prob = jnp.logaddexp(
+        log_teacher_weight + selected_teacher_log_prob,
+        log_student_weight + selected_student_log_prob,
+      )
+      behavior_log_prob = clean_log_prob(behavior_log_prob)
+      policy_extras = {
+        "log_prob": behavior_log_prob,
+        "branch_log_prob": branch_log_prob,
+        "raw_action": _where_with_batch_mask(
+          sampled_teacher, teacher_raw_action, student_raw_action
+        ),
+        "teacher_action": teacher_action,
+        "teacher_raw_action": teacher_raw_action,
+        "teacher_mode_action": teacher_mode_action,
+        "teacher_mode_raw_action": teacher_mode_raw_action,
+        "distribution_params": teacher_distribution_params,
+        "sampled_teacher": sampled_teacher.astype(jnp.float32),
+        "policy_gradient_mask": sampled_teacher.astype(jnp.float32),
+        "teacher_sample_probability": jnp.full(
+          (batch_size,), probability_teacher, dtype=jnp.float32
+        ),
+      }
+      return action, policy_extras
+
+    return policy
+
+  def make_teacher_rollout_policy(training_state: TrainingState) -> types.Policy:
+    return teacher_make_policy(
+      (
+        training_state.teacher.normalizer_params,
+        training_state.teacher.params.policy,
+        training_state.teacher.params.value,
+      )
+    )
+
+  use_teacher_only_rollout = (
+    teacher_sampling_start_probability == 1.0
+    and teacher_sampling_end_probability == 1.0
+  )
+
+  def training_step(
+    carry: Tuple[TrainingState, envs.State, PRNGKey], unused_t
+  ) -> Tuple[Tuple[TrainingState, envs.State, PRNGKey], Metrics]:
+    training_state, state, key = carry
+    key_sgd, key_generate_unroll, new_key = jax.random.split(key, 3)
+    probability_teacher = teacher_sample_probability(training_state.env_steps)
+    if use_teacher_only_rollout:
+      rollout_policy = make_teacher_rollout_policy(training_state)
+    else:
+      rollout_policy = make_mixed_rollout_policy(
+        training_state, probability_teacher
+      )
 
     def f(carry, unused_t):
       current_state, current_key = carry
@@ -668,7 +999,7 @@ def train(
       next_state, data = acting.generate_unroll(
         env,
         current_state,
-        teacher_policy,
+        rollout_policy,
         current_key,
         unroll_length,
         extra_fields=("truncation", "episode_metrics", "episode_done"),
@@ -754,6 +1085,13 @@ def train(
         metrics,
       )
 
+    metrics = {
+      **metrics,
+      "rollout/teacher_sample_probability": probability_teacher,
+      "rollout/teacher_sample_fraction": jnp.array(1.0)
+      if use_teacher_only_rollout
+      else jnp.mean(data.extras["policy_extras"]["sampled_teacher"]),
+    }
     return (new_training_state, state, new_key), metrics
 
   def training_epoch(
@@ -847,6 +1185,22 @@ def train(
       ),
     )
 
+  if restore_teacher_params is not None:
+    teacher_value = (
+      restore_teacher_params[2]
+      if restore_value_fn
+      else teacher_init_params.value
+    )
+    init_training_state = init_training_state.replace(
+      teacher=init_training_state.teacher.replace(
+        normalizer_params=restore_teacher_params[0],
+        params=init_training_state.teacher.params.replace(
+          policy=restore_teacher_params[1],
+          value=teacher_value,
+        ),
+      ),
+    )
+
   if restore_params is not None:
     teacher_value = (
       restore_params[0][2] if restore_value_fn else teacher_init_params.value
@@ -866,39 +1220,112 @@ def train(
     )
 
   if num_timesteps == 0:
-    # When num_timesteps == 0, state is not replicated, so don't use _unpmap
+    # When num_timesteps == 0, state is not replicated, so don't use _unpmap.
+    params = _pack_params(init_training_state)
+    metrics = {}
+    if process_id == 0 and run_evals and num_evals > 0:
+      teacher_num_eval_envs = num_eval_envs // 2
+      student_num_eval_envs = num_eval_envs - teacher_num_eval_envs
+      eval_env = _maybe_wrap_env(
+        eval_env or environment,
+        wrap_env,
+        num_eval_envs,
+        episode_length,
+        action_repeat,
+        device_count=1,
+        key_env=eval_key,
+        wrap_env_fn=wrap_env_fn,
+        randomization_fn=randomization_fn,
+      )
+      teacher_eval_key, student_eval_key = jax.random.split(eval_key)
+      teacher_evaluator = acting.Evaluator(
+        eval_env,
+        functools.partial(
+          policy_wrapper,
+          deterministic=deterministic_eval,
+          agent="teacher",
+        ),
+        num_eval_envs=teacher_num_eval_envs,
+        episode_length=episode_length,
+        action_repeat=action_repeat,
+        key=teacher_eval_key,
+      )
+      student_evaluator = acting.Evaluator(
+        eval_env,
+        functools.partial(
+          policy_wrapper,
+          deterministic=deterministic_eval,
+          agent="student",
+        ),
+        num_eval_envs=student_num_eval_envs,
+        episode_length=episode_length,
+        action_repeat=action_repeat,
+        key=student_eval_key,
+      )
+      teacher_metrics = teacher_evaluator.run_evaluation(params, {})
+      student_metrics = student_evaluator.run_evaluation(params, {})
+      metrics = _merge_l2t_eval_metrics(
+        teacher_metrics,
+        student_metrics,
+        {},
+        teacher_num_eval_envs,
+        student_num_eval_envs,
+        episode_length,
+        num_eval_envs,
+      )
+      logging.info(metrics)
+      progress_fn(0, metrics)
     return (
       policy_wrapper,
-      _pack_params(init_training_state),
-      {},
+      params,
+      metrics,
     )
 
-  training_state = jax.device_put_replicated(
-    init_training_state, jax.local_devices()[:local_devices_to_use]
+  training_state = pmap.bcast_local_devices(
+    init_training_state, local_devices_to_use
   )
 
-  eval_env = _maybe_wrap_env(
-    eval_env or environment,
-    wrap_env,
-    num_eval_envs,
-    episode_length,
-    action_repeat,
-    device_count=1,
-    key_env=eval_key,
-    wrap_env_fn=wrap_env_fn,
-    randomization_fn=randomization_fn,
-  )
-  evaluator = acting.Evaluator(
-    eval_env,
-    functools.partial(
-      policy_wrapper,
-      deterministic=deterministic_eval,
-    ),
-    num_eval_envs=num_eval_envs,
-    episode_length=episode_length,
-    action_repeat=action_repeat,
-    key=eval_key,
-  )
+  teacher_evaluator = None
+  student_evaluator = None
+  teacher_num_eval_envs = num_eval_envs // 2
+  student_num_eval_envs = num_eval_envs - teacher_num_eval_envs
+  if run_evals:
+    eval_env = _maybe_wrap_env(
+      eval_env or environment,
+      wrap_env,
+      num_eval_envs,
+      episode_length,
+      action_repeat,
+      device_count=1,
+      key_env=eval_key,
+      wrap_env_fn=wrap_env_fn,
+      randomization_fn=randomization_fn,
+    )
+    teacher_eval_key, student_eval_key = jax.random.split(eval_key)
+    teacher_evaluator = acting.Evaluator(
+      eval_env,
+      functools.partial(
+        policy_wrapper,
+        deterministic=deterministic_eval,
+        agent="teacher",
+      ),
+      num_eval_envs=teacher_num_eval_envs,
+      episode_length=episode_length,
+      action_repeat=action_repeat,
+      key=teacher_eval_key,
+    )
+    student_evaluator = acting.Evaluator(
+      eval_env,
+      functools.partial(
+        policy_wrapper,
+        deterministic=deterministic_eval,
+        agent="student",
+      ),
+      num_eval_envs=student_num_eval_envs,
+      episode_length=episode_length,
+      action_repeat=action_repeat,
+      key=student_eval_key,
+    )
 
   training_metrics = {}
   training_walltime = 0
@@ -910,12 +1337,26 @@ def train(
   params = _unpmap(_pack_params(training_state))
   policy_params_fn(current_step, host_make_policy, params)
 
+  def run_l2t_evaluation(
+    params: InferenceParams, training_metrics: Metrics
+  ) -> Metrics:
+    if teacher_evaluator is None or student_evaluator is None:
+      return training_metrics
+    teacher_metrics = teacher_evaluator.run_evaluation(params, {})
+    student_metrics = student_evaluator.run_evaluation(params, {})
+    return _merge_l2t_eval_metrics(
+      teacher_metrics,
+      student_metrics,
+      training_metrics,
+      teacher_num_eval_envs,
+      student_num_eval_envs,
+      episode_length,
+      num_eval_envs,
+    )
+
   metrics = {}
   if process_id == 0 and num_evals > 1 and run_evals:
-    metrics = evaluator.run_evaluation(
-      params,
-      training_metrics={},
-    )
+    metrics = run_l2t_evaluation(params, {})
     logging.info(metrics)
     progress_fn(0, metrics)
 
@@ -936,7 +1377,7 @@ def train(
         lambda x, s: jax.random.split(x[0], s), in_axes=(0, None)
       )(key_envs, key_envs.shape[1])
       if num_resets_per_eval > 0:
-        env_state = reset_fn((training_state, env_state), key_envs)
+        env_state = reset_fn(env_state, key_envs)
 
     if process_id != 0:
       continue
@@ -962,10 +1403,7 @@ def train(
     if num_evals > 0:
       metrics = training_metrics
       if run_evals:
-        metrics = evaluator.run_evaluation(
-          params,
-          training_metrics,
-        )
+        metrics = run_l2t_evaluation(params, training_metrics)
       logging.info(metrics)
       progress_fn(current_step, metrics)
 

@@ -407,6 +407,9 @@ def train(
   def reset_fn_donated_env_state(env_state_donated, key_envs):
     return env.reset(key_envs)
 
+  def vmap_reset_fn_donated_env_state(env_state_donated, key_envs):
+    return jax.vmap(env.reset)(key_envs)
+
   key_envs = jax.random.split(key_env, num_envs // process_count)
   key_envs = jnp.reshape(
       key_envs, (local_devices_to_use, -1) + key_envs.shape[1:]
@@ -423,7 +426,9 @@ def train(
     reset_fn_ = jax.jit(jax.vmap(env.reset))
     env_state = reset_fn_(key_envs)
     reset_fn = jax.jit(
-        reset_fn_donated_env_state, donate_argnums=(0,), keep_unused=True
+        vmap_reset_fn_donated_env_state,
+        donate_argnums=(0,),
+        keep_unused=True,
     )
 
   # Discard the batch axes over devices and envs.
@@ -753,8 +758,8 @@ def train(
         {},
     )
 
-  training_state = jax.device_put_replicated(
-      training_state, jax.local_devices()[:local_devices_to_use]
+  training_state = pmap.bcast_local_devices(
+      training_state, local_devices_to_use
   )
 
   eval_env = _maybe_wrap_env(
