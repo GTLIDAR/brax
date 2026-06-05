@@ -361,6 +361,9 @@ def train(
   student_use_huber_loss: bool = False,
   student_huber_delta: float = 1.0,
   student_action_mse_weight: float = 0.0,
+  student_reference_action_mse_weight: float = 0.0,
+  student_reference_action_obs_key: str = "state",
+  student_reference_action_slice: Optional[Tuple[int, int]] = None,
   student_match_distribution_params: bool = False,
   student_ppo_weight: float = 0.0,
   student_clone_teacher_mode: bool = True,
@@ -383,6 +386,18 @@ def train(
     raise ValueError("teacher_sampling_warmup_steps must be non-negative.")
   if student_action_mse_weight < 0.0:
     raise ValueError("student_action_mse_weight must be non-negative.")
+  if student_reference_action_mse_weight < 0.0:
+    raise ValueError(
+      "student_reference_action_mse_weight must be non-negative."
+    )
+  if (
+    student_reference_action_mse_weight > 0.0
+    and student_reference_action_slice is None
+  ):
+    raise ValueError(
+      "student_reference_action_slice is required when "
+      "student_reference_action_mse_weight is positive."
+    )
   if student_ppo_weight < 0.0:
     raise ValueError("student_ppo_weight must be non-negative.")
   _validate_madrona_args(
@@ -562,6 +577,22 @@ def train(
       # Standard MSE loss
       action_loss = jnp.mean(jnp.square(diff))
 
+    reference_action_loss = jnp.array(0.0)
+    reference_action_mse = jnp.array(0.0)
+    if student_reference_action_mse_weight > 0.0:
+      start, end = student_reference_action_slice
+      if isinstance(data.observation, Mapping):
+        reference_obs = data.observation[student_reference_action_obs_key]
+      else:
+        reference_obs = data.observation
+      reference_action = jax.lax.stop_gradient(reference_obs[..., start:end])
+      reference_action_mse = jnp.mean(
+        jnp.square(student_actions - reference_action)
+      )
+      reference_action_loss = (
+        student_reference_action_mse_weight * reference_action_mse
+      )
+
     # Negative log-likelihood loss (more principled for probabilistic policies)
     # Note: Requires teacher to generate raw_action in policy_extras
     nll_loss = 0.0
@@ -682,6 +713,7 @@ def train(
     total_loss = (
       student_bc_weight * bc_loss
       + action_mse_loss
+      + reference_action_loss
       + dist_param_loss
       + entropy_loss
       + student_ppo_weight * (ppo_actor_loss + ppo_entropy_loss)
@@ -693,6 +725,11 @@ def train(
       "action_mse": action_loss,
       "action_mse_loss": action_mse_loss,
       "action_mse_weight": jnp.array(student_action_mse_weight),
+      "reference_action_mse": reference_action_mse,
+      "reference_action_mse_loss": reference_action_loss,
+      "reference_action_mse_weight": jnp.array(
+        student_reference_action_mse_weight
+      ),
       "nll_loss": nll_loss if student_use_nll_loss else jnp.array(0.0),
       "dist_param_loss": dist_param_loss,
       "entropy": entropy,
