@@ -52,6 +52,43 @@ class CheckpointTest(absltest.TestCase):
     self.assertEqual(config.action_size, 3)
     self.assertEqual(config.observation_size, 1)
 
+  def test_load_config_accepts_optional_none_initializers(self):
+    path = self.create_tempdir("test")
+    network_factory = functools.partial(
+        ppo_networks.make_ppo_networks,
+        policy_hidden_layer_sizes=(16, 21, 13),
+    )
+    config = checkpoint.network_config(
+        observation_size=1,
+        action_size=3,
+        normalize_observations=True,
+        network_factory=network_factory,
+    )
+    normalizer_params = running_statistics.init_state(jp.zeros(1), std_eps=0.02)
+    ppo_network = network_factory(
+        config.observation_size,
+        config.action_size,
+        preprocess_observations_fn=running_statistics.normalize,
+        **config.network_factory_kwargs,
+    )
+    dummy_key = jax.random.PRNGKey(0)
+    network_params = ppo_losses.PPONetworkParams(
+        policy=ppo_network.policy_network.init(dummy_key),
+        value=ppo_network.value_network.init(dummy_key),
+    )
+
+    checkpoint.save(
+        path.full_path,
+        step=1,
+        params=(normalizer_params, network_params.policy, network_params.value),
+        config=config,
+    )
+    loaded_config = checkpoint.load_config(
+        epath.Path(path.full_path) / "000000000001"
+    )
+
+    self.assertIsNone(loaded_config.network_factory_kwargs.mean_kernel_init_fn)
+
   def test_save_and_load_checkpoint(self):
     path = self.create_tempdir("test")
     network_factory = functools.partial(

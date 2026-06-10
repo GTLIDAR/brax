@@ -339,6 +339,7 @@ def train(
   eval_env: Optional[envs.Env] = None,
   num_eval_envs: int = 256,
   deterministic_eval: bool = False,
+  fixed_eval_rng: bool = False,
   # training metrics
   log_training_metrics: bool = False,
   training_metrics_steps: Optional[int] = None,
@@ -1286,6 +1287,7 @@ def train(
         episode_length=episode_length,
         action_repeat=action_repeat,
         key=teacher_eval_key,
+        fixed_key=fixed_eval_rng,
       )
       student_evaluator = acting.Evaluator(
         eval_env,
@@ -1298,6 +1300,7 @@ def train(
         episode_length=episode_length,
         action_repeat=action_repeat,
         key=student_eval_key,
+        fixed_key=fixed_eval_rng,
       )
       teacher_metrics = teacher_evaluator.run_evaluation(params, {})
       student_metrics = student_evaluator.run_evaluation(params, {})
@@ -1350,6 +1353,7 @@ def train(
       episode_length=episode_length,
       action_repeat=action_repeat,
       key=teacher_eval_key,
+      fixed_key=fixed_eval_rng,
     )
     student_evaluator = acting.Evaluator(
       eval_env,
@@ -1362,6 +1366,7 @@ def train(
       episode_length=episode_length,
       action_repeat=action_repeat,
       key=student_eval_key,
+      fixed_key=fixed_eval_rng,
     )
 
   training_metrics = {}

@@ -227,6 +227,7 @@ def train(
     eval_env: Optional[envs.Env] = None,
     num_eval_envs: int = 128,
     deterministic_eval: bool = False,
+    fixed_eval_rng: bool = False,
     # training metrics
     log_training_metrics: bool = False,
     training_metrics_steps: Optional[int] = None,
@@ -312,6 +313,8 @@ def train(
     num_eval_envs: the number of envs to use for evluation. Each env will run 1
       episode, and all envs run in parallel during eval.
     deterministic_eval: whether to run the eval with a deterministic policy
+    fixed_eval_rng: whether to reuse the same eval RNG every evaluation. This
+      keeps randomized eval conditions fixed across training checkpoints.
     log_training_metrics: whether to log training metrics and callback to
       progress_fn
     training_metrics_steps: the number of environment steps between logging
@@ -780,6 +783,7 @@ def train(
       episode_length=episode_length,
       action_repeat=action_repeat,
       key=eval_key,
+      fixed_key=fixed_eval_rng,
   )
 
   training_metrics = {}

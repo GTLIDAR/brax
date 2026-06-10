@@ -96,6 +96,7 @@ class Evaluator:
       episode_length: int,
       action_repeat: int,
       key: PRNGKey,
+      fixed_key: bool = False,
   ):
     """Init.
 
@@ -106,8 +107,11 @@ class Evaluator:
       episode_length: Maximum length of an episode.
       action_repeat: Number of physics steps per env step.
       key: RNG key.
+      fixed_key: If True, reuse ``key`` for every eval so randomized eval
+        conditions are identical across evaluation calls.
     """
     self._key = key
+    self._fixed_key = bool(fixed_key)
     self._eval_walltime = 0.0
 
     eval_env = envs.training.EvalWrapper(eval_env)
@@ -140,7 +144,10 @@ class Evaluator:
       aggregate_episodes: bool = True,
   ) -> Metrics:
     """Run one epoch of evaluation."""
-    self._key, unroll_key = jax.random.split(self._key)
+    if self._fixed_key:
+      unroll_key = self._key
+    else:
+      self._key, unroll_key = jax.random.split(self._key)
 
     t = time.time()
     eval_state = self._generate_eval_unroll(

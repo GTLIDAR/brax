@@ -63,10 +63,12 @@ class VmapWrapper(Wrapper):
     super().__init__(env)
     self.batch_size = batch_size
 
-  def reset(self, rng: jax.Array) -> State:
+  def reset(self, rng: jax.Array, failure_bias=None) -> State:
     if self.batch_size is not None:
       rng = jax.random.split(rng, self.batch_size)
-    return jax.vmap(self.env.reset)(rng)
+    if failure_bias is None:
+      return jax.vmap(self.env.reset)(rng)
+    return jax.vmap(self.env.reset)(rng, failure_bias)
 
   def step(self, state: State, action: jax.Array) -> State:
     return jax.vmap(self.env.step)(state, action)
@@ -80,8 +82,11 @@ class EpisodeWrapper(Wrapper):
     self.episode_length = episode_length
     self.action_repeat = action_repeat
 
-  def reset(self, rng: jax.Array) -> State:
-    state = self.env.reset(rng)
+  def reset(self, rng: jax.Array, failure_bias=None) -> State:
+    if failure_bias is None:
+      state = self.env.reset(rng)
+    else:
+      state = self.env.reset(rng, failure_bias=failure_bias)
     state.info['steps'] = jp.zeros(rng.shape[:-1])
     state.info['truncation'] = jp.zeros(rng.shape[:-1])
     # Keep separate record of episode done as state.info['done'] can be erased

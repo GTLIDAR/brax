@@ -225,8 +225,9 @@ def load_config(
     if init_fn_name not in loaded_dict['network_factory_kwargs']:
       continue
     init_fn_name_ = loaded_dict['network_factory_kwargs'][init_fn_name]
-    loaded_dict['network_factory_kwargs'][init_fn_name] = (
-        networks.KERNEL_INITIALIZER[init_fn_name_]
-    )
+    if init_fn_name_ is not None:
+      loaded_dict['network_factory_kwargs'][init_fn_name] = (
+          networks.KERNEL_INITIALIZER[init_fn_name_]
+      )
 
   return config_dict.create(**loaded_dict)
