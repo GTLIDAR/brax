@@ -74,7 +74,8 @@ def load(path: Union[str, epath.Path]) -> InferenceParams:
   if not path.exists():
     raise ValueError(f"checkpoint path does not exist: {path.as_posix()}")
 
-  metadata = ocp.PyTreeCheckpointer().metadata(path).item_metadata
+  metadata = ocp.PyTreeCheckpointer().metadata(path)
+  metadata = getattr(metadata, "item_metadata", metadata)
   restore_args = jax.tree.map(
     lambda _: ocp.RestoreArgs(restore_type=np.ndarray), metadata
   )
@@ -85,6 +86,10 @@ def load(path: Union[str, epath.Path]) -> InferenceParams:
 
   teacher_norm, teacher_policy, teacher_value = target[0]
   student_norm, student_policy = target[1]
+
+  for norm in (teacher_norm, student_norm):
+    if isinstance(norm["count"], dict) and "hi" in norm["count"]:
+      norm["count"] = types.UInt64(**norm["count"])
 
   teacher_norm = running_statistics.RunningStatisticsState(**teacher_norm)
   student_norm = running_statistics.RunningStatisticsState(**student_norm)

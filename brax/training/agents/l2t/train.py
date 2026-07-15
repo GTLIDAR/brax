@@ -21,6 +21,7 @@ import time
 from typing import Any, Callable, Mapping, Optional, Tuple, Union
 
 from absl import logging
+from etils import epath
 import flax
 import jax
 import jax.numpy as jnp
@@ -371,6 +372,32 @@ def train(
   teacher_sampling_start_probability: float = 1.0,
   teacher_sampling_end_probability: float = 0.8,
   teacher_sampling_warmup_steps: int = 0,
+  # Phased "distill-then-refine" schedule. Phase A (env_steps <
+  # student_rl_start_step): pure BC, teacher trains normally. Phase B (after the
+  # start step + warmup): student PPO weight ramps to student_ppo_weight, BC
+  # weight decays from student_bc_weight to student_bc_anchor_weight, and (if
+  # freeze_teacher_policy) the teacher POLICY is frozen while its value/critic
+  # keeps training on the student-generated rollouts.
+  student_rl_start_step: float = 0.0,
+  student_rl_warmup_steps: float = 0.0,
+  student_bc_anchor_weight: Optional[float] = None,
+  freeze_teacher_policy: bool = False,
+  # Adaptive KL-triggered crossover. If student_rl_kl_threshold is set, Phase B
+  # is triggered when the teacher's smoothed PPO kl_mean stays below the
+  # threshold (policy converged) -- but only after student_rl_min_guard_steps
+  # env-steps AND once the teacher eval return clears student_rl_return_floor
+  # (both guard against the pre-takeoff flat-KL region). Otherwise the fixed
+  # student_rl_start_step is used.
+  student_rl_kl_threshold: Optional[float] = None,
+  student_rl_min_guard_steps: float = 0.0,
+  student_rl_return_floor: float = 0.0,
+  student_rl_kl_patience: int = 1,
+  student_rl_kl_ema: float = 0.5,
+  student_rl_dagger: bool = False,
+  # Fallback: force the Phase-B crossover once this env-step is reached, even if
+  # the KL trigger never fires (e.g. the teacher keeps improving and never
+  # "converges"). Guarantees Phase B engages within the budget.
+  student_rl_force_crossover_step: Optional[float] = None,
 ):
   """Runs joint training of a PPO teacher and an L2 imitation student."""
   assert batch_size * num_minibatches % num_envs == 0
@@ -550,6 +577,8 @@ def train(
     key_loss: PRNGKey,
     teacher_normalizer_params: running_statistics.RunningStatisticsState,
     teacher_value_params: Params,
+    bc_weight: jax.Array,
+    ppo_weight: jax.Array,
   ):
     logits = l2t_net.student_policy.apply(
       normalizer_params, params, data.observation
@@ -712,16 +741,18 @@ def train(
       ppo_mask_mean = jnp.mean(student_policy_mask)
 
     total_loss = (
-      student_bc_weight * bc_loss
+      bc_weight * bc_loss
       + action_mse_loss
       + reference_action_loss
       + dist_param_loss
       + entropy_loss
-      + student_ppo_weight * (ppo_actor_loss + ppo_entropy_loss)
+      + ppo_weight * (ppo_actor_loss + ppo_entropy_loss)
     )
 
     metrics = {
       "total_loss": total_loss,
+      "bc_weight": bc_weight,
+      "ppo_weight": ppo_weight,
       "bc_loss": bc_loss,
       "action_mse": action_loss,
       "action_mse_loss": action_mse_loss,
@@ -758,6 +789,7 @@ def train(
     carry,
     data: types.Transition,
     normalizer_params: running_statistics.RunningStatisticsState,
+    policy_grad_scale: jax.Array,
   ):
     optimizer_state, params, key = carry
     key, key_loss = jax.random.split(key)
@@ -775,7 +807,16 @@ def train(
     params_update, optimizer_state = teacher_optimizer.update(
       grads, optimizer_state
     )
+    # Phase B: scale the policy update (0.0 = frozen policy) while leaving the
+    # value/critic update intact so the privileged critic keeps tracking the
+    # student's shifting state distribution.
+    params_update = params_update.replace(
+      policy=jax.tree_util.tree_map(
+        lambda u: u * policy_grad_scale, params_update.policy
+      )
+    )
     params = optax.apply_updates(params, params_update)
+    metrics["teacher_policy_grad_scale"] = policy_grad_scale
     return (optimizer_state, params, key), metrics
 
   def student_minibatch_step(
@@ -784,6 +825,8 @@ def train(
     normalizer_params: running_statistics.RunningStatisticsState,
     teacher_normalizer_params: running_statistics.RunningStatisticsState,
     teacher_value_params: Params,
+    bc_weight: jax.Array,
+    ppo_weight: jax.Array,
   ):
     optimizer_state, params = carry
     (_, metrics), params, optimizer_state = student_gradient_update_fn(
@@ -793,6 +836,8 @@ def train(
       jax.random.PRNGKey(0),
       teacher_normalizer_params,
       teacher_value_params,
+      bc_weight,
+      ppo_weight,
       optimizer_state=optimizer_state,
     )
     metrics["learning_rate"] = jnp.array(student_lr, dtype=float)
@@ -814,12 +859,35 @@ def train(
       * progress
     )
 
+  bc_anchor_weight = (
+    student_bc_anchor_weight
+    if student_bc_anchor_weight is not None
+    else student_bc_weight
+  )
+
+  def student_rl_progress(
+    env_steps: types.UInt64, crossover_start_step: jax.Array
+  ) -> jax.Array:
+    """0.0 in Phase A, ramps to 1.0 across the Phase-B warmup window.
+
+    ``crossover_start_step`` is the env-step at which Phase B begins. In fixed
+    mode it is the constant ``student_rl_start_step``; in adaptive (KL-triggered)
+    mode it is latched at runtime by the training loop and passed in as a traced
+    scalar (a large sentinel keeps progress at 0 until the trigger fires).
+    """
+    warm = max(float(student_rl_warmup_steps), 1.0)
+    steps = _uint64_to_float(env_steps)
+    return jnp.clip((steps - crossover_start_step) / warm, 0.0, 1.0)
+
   def sgd_step(
     carry,
     unused_t,
     data: types.Transition,
     teacher_norm: running_statistics.RunningStatisticsState,
     student_norm: running_statistics.RunningStatisticsState,
+    bc_weight: jax.Array,
+    ppo_weight: jax.Array,
+    policy_grad_scale: jax.Array,
   ):
     (
       teacher_optimizer_state,
@@ -853,7 +921,9 @@ def train(
     (teacher_optimizer_state, teacher_params, _), teacher_metrics = (
       jax.lax.scan(
         functools.partial(
-          teacher_minibatch_step, normalizer_params=teacher_norm
+          teacher_minibatch_step,
+          normalizer_params=teacher_norm,
+          policy_grad_scale=policy_grad_scale,
         ),
         (teacher_optimizer_state, teacher_params, key_grad),
         shuffled_data,
@@ -867,6 +937,8 @@ def train(
         normalizer_params=student_norm,
         teacher_normalizer_params=teacher_norm,
         teacher_value_params=teacher_params.value,
+        bc_weight=bc_weight,
+        ppo_weight=ppo_weight,
       ),
       (student_optimizer_state, student_params),
       shuffled_data,
@@ -1019,11 +1091,31 @@ def train(
   )
 
   def training_step(
-    carry: Tuple[TrainingState, envs.State, PRNGKey], unused_t
+    carry: Tuple[TrainingState, envs.State, PRNGKey],
+    unused_t,
+    crossover_start_step: jax.Array,
   ) -> Tuple[Tuple[TrainingState, envs.State, PRNGKey], Metrics]:
     training_state, state, key = carry
     key_sgd, key_generate_unroll, new_key = jax.random.split(key, 3)
     probability_teacher = teacher_sample_probability(training_state.env_steps)
+    rl_progress = student_rl_progress(
+      training_state.env_steps, crossover_start_step
+    )
+    ppo_weight_eff = student_ppo_weight * rl_progress
+    bc_weight_eff = (
+      student_bc_weight * (1.0 - rl_progress) + bc_anchor_weight * rl_progress
+    )
+    policy_grad_scale = 1.0 - rl_progress * (
+      1.0 if freeze_teacher_policy else 0.0
+    )
+    if student_rl_dagger:
+      # DAgger: as Phase B ramps in, shift rollouts from teacher-driven to
+      # student-driven so the (now frozen) teacher labels the student's own
+      # visited states.
+      probability_teacher = (
+        teacher_sampling_start_probability * (1.0 - rl_progress)
+        + teacher_sampling_end_probability * rl_progress
+      )
     if use_teacher_only_rollout:
       rollout_policy = make_teacher_rollout_policy(training_state)
     else:
@@ -1057,11 +1149,24 @@ def train(
 
     teacher_normalizer_params = training_state.teacher.normalizer_params
     if not lr_is_adaptive_kl:
-      teacher_normalizer_params = running_statistics.update(
+      updated_teacher_norm = running_statistics.update(
         teacher_normalizer_params,
         _remove_pixels(data.observation),
         pmap_axis_name=_PMAP_AXIS_NAME,
       )
+      if freeze_teacher_policy:
+        # Once the teacher policy is frozen (Phase B), also freeze its
+        # normalizer: otherwise the DAgger student-driven rollouts drift the
+        # teacher's obs stats, mis-normalizing the frozen policy and degrading
+        # both its eval and the BC target (dragging the student down).
+        keep_frozen = policy_grad_scale <= 0.0
+        teacher_normalizer_params = jax.tree_util.tree_map(
+          lambda old, new: jnp.where(keep_frozen, old, new),
+          teacher_normalizer_params,
+          updated_teacher_norm,
+        )
+      else:
+        teacher_normalizer_params = updated_teacher_norm
     student_normalizer_params = running_statistics.update(
       training_state.student.normalizer_params,
       _remove_pixels(data.observation),
@@ -1074,6 +1179,9 @@ def train(
         data=data,
         teacher_norm=teacher_normalizer_params,
         student_norm=student_normalizer_params,
+        bc_weight=bc_weight_eff,
+        ppo_weight=ppo_weight_eff,
+        policy_grad_scale=policy_grad_scale,
       ),
       (
         training_state.teacher.optimizer_state,
@@ -1129,14 +1237,23 @@ def train(
       "rollout/teacher_sample_fraction": jnp.array(1.0)
       if use_teacher_only_rollout
       else jnp.mean(data.extras["policy_extras"]["sampled_teacher"]),
+      "schedule/student_rl_progress": rl_progress,
+      "schedule/student_ppo_weight": ppo_weight_eff,
+      "schedule/student_bc_weight": bc_weight_eff,
+      "schedule/teacher_policy_grad_scale": policy_grad_scale,
     }
     return (new_training_state, state, new_key), metrics
 
   def training_epoch(
-    training_state: TrainingState, state: envs.State, key: PRNGKey
+    training_state: TrainingState,
+    state: envs.State,
+    key: PRNGKey,
+    crossover_start_step: jax.Array,
   ) -> Tuple[TrainingState, envs.State, Metrics]:
     (training_state, state, _), loss_metrics = jax.lax.scan(
-      training_step,
+      functools.partial(
+        training_step, crossover_start_step=crossover_start_step
+      ),
       (training_state, state, key),
       (),
       length=num_training_steps_per_epoch,
@@ -1151,12 +1268,17 @@ def train(
   )
 
   def training_epoch_with_timing(
-    training_state: TrainingState, env_state: envs.State, key: PRNGKey
+    training_state: TrainingState,
+    env_state: envs.State,
+    key: PRNGKey,
+    crossover_start_step: jax.Array,
   ) -> Tuple[TrainingState, envs.State, Metrics]:
     nonlocal training_walltime
     t = time.time()
     training_state, env_state = _strip_weak_type((training_state, env_state))
-    result = training_epoch(training_state, env_state, key)
+    result = training_epoch(
+      training_state, env_state, key, crossover_start_step
+    )
     training_state, env_state, metrics = _strip_weak_type(result)
 
     metrics = jax.tree_util.tree_map(jnp.mean, metrics)
@@ -1206,6 +1328,8 @@ def train(
 
   if restore_checkpoint_path is not None:
     restored = l2t_checkpoint.load(restore_checkpoint_path)
+    checkpoint_name = epath.Path(restore_checkpoint_path).name
+    restored_env_steps = int(checkpoint_name) if checkpoint_name.isdigit() else 0
     teacher_value = (
       restored[0][2] if restore_value_fn else teacher_init_params.value
     )
@@ -1220,6 +1344,10 @@ def train(
       student=init_training_state.student.replace(
         normalizer_params=restored[1][0],
         params=restored[1][1],
+      ),
+      env_steps=types.UInt64(
+        hi=jnp.asarray(restored_env_steps >> 32, dtype=jnp.uint32),
+        lo=jnp.asarray(restored_env_steps & 0xFFFFFFFF, dtype=jnp.uint32),
       ),
     )
 
@@ -1260,24 +1388,37 @@ def train(
   if num_timesteps == 0:
     # When num_timesteps == 0, state is not replicated, so don't use _unpmap.
     params = _pack_params(init_training_state)
+    current_step = int(init_training_state.env_steps)
+    policy_params_fn(current_step, policy_wrapper, params)
     metrics = {}
     if process_id == 0 and run_evals and num_evals > 0:
       teacher_num_eval_envs = num_eval_envs // 2
       student_num_eval_envs = num_eval_envs - teacher_num_eval_envs
-      eval_env = _maybe_wrap_env(
+      teacher_eval_key, student_eval_key = jax.random.split(eval_key)
+      teacher_eval_env = _maybe_wrap_env(
         eval_env or environment,
         wrap_env,
-        num_eval_envs,
+        teacher_num_eval_envs,
         episode_length,
         action_repeat,
         device_count=1,
-        key_env=eval_key,
+        key_env=teacher_eval_key,
         wrap_env_fn=wrap_env_fn,
         randomization_fn=randomization_fn,
       )
-      teacher_eval_key, student_eval_key = jax.random.split(eval_key)
+      student_eval_env = _maybe_wrap_env(
+        eval_env or environment,
+        wrap_env,
+        student_num_eval_envs,
+        episode_length,
+        action_repeat,
+        device_count=1,
+        key_env=student_eval_key,
+        wrap_env_fn=wrap_env_fn,
+        randomization_fn=randomization_fn,
+      )
       teacher_evaluator = acting.Evaluator(
-        eval_env,
+        teacher_eval_env,
         functools.partial(
           policy_wrapper,
           deterministic=deterministic_eval,
@@ -1290,7 +1431,7 @@ def train(
         fixed_key=fixed_eval_rng,
       )
       student_evaluator = acting.Evaluator(
-        eval_env,
+        student_eval_env,
         functools.partial(
           policy_wrapper,
           deterministic=deterministic_eval,
@@ -1330,20 +1471,31 @@ def train(
   teacher_num_eval_envs = num_eval_envs // 2
   student_num_eval_envs = num_eval_envs - teacher_num_eval_envs
   if run_evals:
-    eval_env = _maybe_wrap_env(
+    teacher_eval_key, student_eval_key = jax.random.split(eval_key)
+    teacher_eval_env = _maybe_wrap_env(
       eval_env or environment,
       wrap_env,
-      num_eval_envs,
+      teacher_num_eval_envs,
       episode_length,
       action_repeat,
       device_count=1,
-      key_env=eval_key,
+      key_env=teacher_eval_key,
       wrap_env_fn=wrap_env_fn,
       randomization_fn=randomization_fn,
     )
-    teacher_eval_key, student_eval_key = jax.random.split(eval_key)
+    student_eval_env = _maybe_wrap_env(
+      eval_env or environment,
+      wrap_env,
+      student_num_eval_envs,
+      episode_length,
+      action_repeat,
+      device_count=1,
+      key_env=student_eval_key,
+      wrap_env_fn=wrap_env_fn,
+      randomization_fn=randomization_fn,
+    )
     teacher_evaluator = acting.Evaluator(
-      eval_env,
+      teacher_eval_env,
       functools.partial(
         policy_wrapper,
         deterministic=deterministic_eval,
@@ -1356,7 +1508,7 @@ def train(
       fixed_key=fixed_eval_rng,
     )
     student_evaluator = acting.Evaluator(
-      eval_env,
+      student_eval_env,
       functools.partial(
         policy_wrapper,
         deterministic=deterministic_eval,
@@ -1371,7 +1523,7 @@ def train(
 
   training_metrics = {}
   training_walltime = 0
-  current_step = 0
+  current_step = int(_unpmap(training_state.env_steps))
 
   def host_make_policy(params, deterministic=False, agent="student"):
     return policy_wrapper(params, deterministic=deterministic, agent=agent)
@@ -1404,14 +1556,36 @@ def train(
 
   num_evals_after_init = max(num_evals - 1, 1)
 
+  # Phase-B crossover control. In adaptive mode (student_rl_kl_threshold set) the
+  # start step is latched here in the Python loop when the teacher's smoothed
+  # kl_mean drops below the threshold (subject to the guards); otherwise it is
+  # the fixed student_rl_start_step. A large sentinel keeps Phase A active until
+  # the latch fires.
+  adaptive_crossover = (
+    student_rl_kl_threshold is not None
+    or student_rl_force_crossover_step is not None
+  )
+  crossover_sentinel = float(num_timesteps) * 10.0 + 1.0
+  crossover_start_value = (
+    crossover_sentinel if adaptive_crossover else float(student_rl_start_step)
+  )
+  crossover_latched = not adaptive_crossover
+  kl_ema = None
+  kl_patience_count = 0
+
   for it in range(num_evals_after_init):
     logging.info("starting iteration %s %s", it, time.time() - xt)
 
     for _ in range(max(num_resets_per_eval, 1)):
       epoch_key, local_key = jax.random.split(local_key)
       epoch_keys = jax.random.split(epoch_key, local_devices_to_use)
+      crossover_scalar = jnp.full(
+        (local_devices_to_use,), crossover_start_value, dtype=jnp.float32
+      )
       (training_state, env_state, training_metrics) = (
-        training_epoch_with_timing(training_state, env_state, epoch_keys)
+        training_epoch_with_timing(
+          training_state, env_state, epoch_keys, crossover_scalar
+        )
       )
       current_step = int(_unpmap(training_state.env_steps))
 
@@ -1446,6 +1620,51 @@ def train(
       metrics = training_metrics
       if run_evals:
         metrics = run_l2t_evaluation(params, training_metrics)
+
+      # Adaptive Phase-B crossover: KL-triggered, with a hard step fallback.
+      if adaptive_crossover and not crossover_latched:
+        kl_value = training_metrics.get("training/kl_mean")
+        if kl_value is not None:
+          kl_value = float(kl_value)
+          kl_ema = (
+            kl_value
+            if kl_ema is None
+            else student_rl_kl_ema * kl_value
+            + (1.0 - student_rl_kl_ema) * kl_ema
+          )
+        teacher_ret = float(metrics.get("eval/teacher/episode_reward", -1e30))
+        guards_ok = (
+          current_step >= student_rl_min_guard_steps
+          and teacher_ret >= student_rl_return_floor
+        )
+        if (
+          student_rl_kl_threshold is not None
+          and kl_ema is not None
+          and guards_ok
+          and kl_ema < student_rl_kl_threshold
+        ):
+          kl_patience_count += 1
+        else:
+          kl_patience_count = 0
+        force_step = (
+          student_rl_force_crossover_step is not None
+          and current_step >= student_rl_force_crossover_step
+        )
+        if kl_patience_count >= student_rl_kl_patience or force_step:
+          crossover_start_value = float(current_step)
+          crossover_latched = True
+          logging.info(
+            "Phase-B crossover latched at step %d (kl_ema=%s, forced=%s)",
+            current_step,
+            f"{kl_ema:.5f}" if kl_ema is not None else "n/a",
+            force_step,
+          )
+      metrics["schedule/crossover_start_step"] = crossover_start_value
+      metrics["schedule/crossover_latched"] = float(crossover_latched)
+      metrics["schedule/kl_ema"] = (
+        float(kl_ema) if kl_ema is not None else float("nan")
+      )
+
       logging.info(metrics)
       progress_fn(current_step, metrics)
 

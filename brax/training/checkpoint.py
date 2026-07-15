@@ -188,7 +188,8 @@ def load(
 
   logging.info('restoring from checkpoint %s', path.as_posix())
 
-  metadata = ocp.PyTreeCheckpointer().metadata(path).item_metadata
+  metadata = ocp.PyTreeCheckpointer().metadata(path)
+  metadata = getattr(metadata, "item_metadata", metadata)
   restore_args = jax.tree.map(
       lambda _: ocp.RestoreArgs(restore_type=np.ndarray), metadata
   )
